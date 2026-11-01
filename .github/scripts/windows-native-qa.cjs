@@ -5,7 +5,7 @@ const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const {
   REPO, BASELINE, CANDIDATE_VERSION, QaError, requireThat, numericId, sha256,
-  runUrl, checkRun, checkRelease, verifyUpdater,
+  runUrl, checkRun, checkHealth, checkRelease, verifyUpdater,
 } = require("./windows-contract.cjs");
 
 function root() {
@@ -44,14 +44,26 @@ async function githubJson(endpoint) {
   requireThat(response.ok, "github_read_failed");
   return await response.json();
 }
-async function health() {
-  const response = await fetch("https://simon.maat.work/api/health", {
-    redirect: "error", signal: AbortSignal.timeout(3_000), headers: { "cache-control": "no-cache" },
+async function health(boundary) {
+  let body;
+  try {
+    const response = await fetch("https://simon.maat.work/api/health", {
+      redirect: "error", signal: AbortSignal.timeout(3_000), headers: { "cache-control": "no-cache" },
+    });
+    requireThat(response.status === 200, "public_health_failed");
+    // Health only: no auth token, model warmup, chat endpoint or API-only login.
+    body = await response.json();
+  } catch (error) {
+    if (error instanceof QaError) throw error;
+    throw new QaError("public_health_failed");
+  }
+  checkHealth(body);
+  // Only the fixed endpoint/contract and last guarded boundary leave this call.
+  // Never persist the health body, credentials, session or restored history.
+  await record("backend", {
+    endpoint: "https://simon.maat.work/api/health", httpStatus: 200,
+    chatResume: "read-only-v1", checkedBefore: boundary,
   });
-  requireThat(response.status === 200, "public_health_failed");
-  // Health only: no auth token, model warmup, chat endpoint or API-only login.
-  const body = await response.json();
-  requireThat(body?.ok === true && body.db === "ok" && body.liveness?.status === "ok", "public_health_failed");
 }
 async function assertTrustedRun() {
   const [repository, head] = await Promise.all([
@@ -132,6 +144,7 @@ async function prepare() {
     state: mode === "full-generation" ? "not-dispatched" : "not-requested",
     requestCount: 0, attemptCount: 0, deadlineMs: 30_000,
   });
+  await health("prepare");
   const baseline = await downloadRelease("baseline", BASELINE, false);
   const selectedCandidate = candidate ? await downloadRelease("candidate", candidate, true) : null;
   await writeJson("selection.json", {
@@ -171,7 +184,7 @@ async function summarize() {
   }
   // Only this structured evidence file is emitted. No stdout/stderr from the
   // application, Playwright error/locator messages, HAR, trace, DOM or image.
-  const permitted = ["schema", "result", "run", "assets", "installBaseline", "installCandidate", "loginBaseline",
+  const permitted = ["schema", "result", "run", "backend", "assets", "installBaseline", "installCandidate", "loginBaseline",
     "loginCandidate", "telemetry", "consent", "generation", "failure"];
   const publicEvidence = Object.fromEntries(permitted.filter((name) => data[name] !== undefined).map((name) => [name, data[name]]));
   publicEvidence.releaseAcceptance = "not-claimed";
@@ -194,8 +207,12 @@ async function cli(action, operation) {
 }
 if (require.main === module) {
   const action = process.argv[2];
-  const operations = { prepare, cleanup: stopNative, summarize };
-  void cli(["prepare", "cleanup", "summarize"].includes(action) ? action : "invalid_action", async () => {
+  const operations = { prepare, cleanup: stopNative, summarize, health: async () => {
+    const label = process.argv[3];
+    requireThat(label === "baseline" || label === "candidate", "invalid_label");
+    await health(`${label}-nsis`);
+  } };
+  void cli(["prepare", "cleanup", "summarize", "health"].includes(action) ? action : "invalid_action", async () => {
     requireThat(Boolean(operations[action]), "invalid_action");
     await operations[action]();
   });

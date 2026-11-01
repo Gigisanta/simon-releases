@@ -44,6 +44,10 @@ try {
         if (Test-Path -LiteralPath (Join-Path $root 'native.json')) { throw 'baseline_process_still_owned' }
     }
     $started = [Diagnostics.Stopwatch]::StartNew()
+    # NSIS is executable code and may start the app itself. Reuse the public
+    # no-wake health gate BEFORE Start-Process, for baseline and candidate alike.
+    & node (Join-Path $PSScriptRoot 'windows-native-qa.cjs') health $Version
+    if ($LASTEXITCODE -ne 0) { throw 'backend_resume_boundary_failed' }
     # /D must be last and unquoted per NSIS. No custom installer/repacked binary.
     $process = Start-Process -FilePath $installer -ArgumentList "/S /D=$installDirectory" -PassThru
     if (-not $process.WaitForExit(120000)) {
@@ -86,8 +90,8 @@ try {
     $allowed = @('hosted_windows_required', 'invalid_qa_directory', 'unverified_installer',
         'installation_identity_mismatch', 'installer_checksum_mismatch', 'authenticode_identity_changed',
         'baseline_not_fresh', 'upgrade_baseline_missing', 'upgrade_baseline_version_mismatch',
-        'baseline_process_still_owned', 'nsis_deadline', 'nsis_nonzero_exit', 'installed_executable_missing',
-        'installed_version_identity_mismatch', 'nsis_registration_mismatch')
+        'baseline_process_still_owned', 'backend_resume_boundary_failed', 'nsis_deadline', 'nsis_nonzero_exit',
+        'installed_executable_missing', 'installed_version_identity_mismatch', 'nsis_registration_mismatch')
     if ($allowed -ccontains $_.Exception.Message) { $code = $_.Exception.Message }
     if ($root -and (Test-Path -LiteralPath (Join-Path $root 'evidence.json'))) {
         $evidencePath = Join-Path $root 'evidence.json'

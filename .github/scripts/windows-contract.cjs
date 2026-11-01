@@ -44,6 +44,11 @@ function checkRun(env, repository, head) {
   requireThat(["baseline-login", "upgrade-login", "full-generation"].includes(env.SIMON_QA_MODE), "invalid_mode");
   runUrl(env);
 }
+function checkHealth(body) {
+  requireThat(body?.ok === true && body.db === "ok" && body.liveness?.status === "ok", "public_health_failed");
+  // A code capability, not a rollout flag or an inference/version probe.
+  requireThat(body.capabilities?.chatResume === "read-only-v1", "chat_resume_capability_required");
+}
 function oneAsset(release, name) {
   const matches = release.assets?.filter((asset) => asset.name === name) ?? [];
   requireThat(matches.length === 1, "ambiguous_release_asset");
@@ -126,6 +131,6 @@ function checkFixture(data, expectedEmail) {
 
 module.exports = {
   REPO, WORKFLOW, BASELINE, CANDIDATE_VERSION, PROMPT, FIXTURE_ID, DEADLINE_MS,
-  QaError, requireThat, numericId, sha256, runUrl, checkRun, checkRelease, verifyUpdater,
+  QaError, requireThat, numericId, sha256, runUrl, checkRun, checkHealth, checkRelease, verifyUpdater,
   outsideQuietWindow, checkAdmission, checkFixture,
 };

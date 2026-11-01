@@ -106,6 +106,9 @@ async function attach(state, deadline) {
   return { browser, page, context: page.context(), nativeState: state };
 }
 async function launch(label, deadline) {
+  // A retained session may resume as soon as product JS is allowed to run.
+  // This must precede the executable, not merely the later password login.
+  await health(`${label}-launch`);
   const selection = await readJson("selection.json");
   const port = await unusedPort();
   const child = spawn(selection.executable, [], {
@@ -196,9 +199,11 @@ async function login(label) {
     restoredSession = true;
     const logout = page.getByRole("button", { name: "Cerrar sesión", exact: true });
     requireThat(await logout.count() === 1, "ambiguous_logout_control");
+    await health(`${label}-logout`);
     await logout.click({ timeout: remaining(deadline) });
   }
   if (await page.getByRole("link", { name: "Ya tengo cuenta", exact: true }).count()) {
+    await health(`${label}-login-navigation`);
     await page.getByRole("link", { name: "Ya tengo cuenta", exact: true }).click({ timeout: remaining(deadline) });
   }
   const identity = page.getByRole("textbox", { name: "Email", exact: true });
@@ -207,6 +212,7 @@ async function login(label) {
   requireThat(await identity.count() === 1 && await secret.count() === 1, "ambiguous_login_control");
   await identity.fill(email, { timeout: remaining(deadline) });
   await secret.fill(password, { timeout: remaining(deadline) });
+  await health(`${label}-sign-in`);
   const signIn = page.waitForResponse((response) => isApi(response, "/api/auth/sign-in/email") &&
     response.request().method() === "POST", { timeout: remaining(deadline) });
   const session = page.waitForResponse((response) => isApi(response, "/api/auth/get-session") &&
@@ -244,6 +250,7 @@ async function login(label) {
   // the next exact GitHub step. CLI process exit detaches CDP, not the WebView.
 }
 async function existingPage() {
+  await health("candidate-attach");
   const state = await readJson("native.json");
   requireThat(state.label === "candidate", "candidate_not_running");
   return await attach(state, Date.now() + DEADLINE_MS);
@@ -257,6 +264,9 @@ async function consent() {
   // Fail before the ready/admission step, even if IA was separately granted.
   assertGenerationPrerequisites(evidence.loginCandidate);
   const deadline = Date.now() + DEADLINE_MS;
+  // A reload reenters session/history restoration; never rely on an earlier
+  // prepare/install/login observation if the backend has since changed.
+  await health("candidate-restore");
   const freshSession = page.waitForResponse((response) => isApi(response, "/api/auth/get-session") &&
     response.request().method() === "GET", { timeout: remaining(deadline) });
   const freshConsent = page.waitForResponse((response) => isApi(response, "/api/user/ai-consent") &&
@@ -358,7 +368,7 @@ async function generate() {
       await assertTrustedRun();
       const liveRelease = await githubJson(`/repos/${REPO}/releases/${selection.candidate.releaseId}`);
       checkRelease(liveRelease, selection.candidate, true);
-      await health();
+      await health("generation-dispatch");
       await telemetryEvidence(page, nativeState);
       await waitForGenerationComposer(page, ready, Date.now() + DEADLINE_MS);
       finalStatuses = await statuses();

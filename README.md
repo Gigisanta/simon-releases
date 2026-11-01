@@ -75,9 +75,10 @@ sigue exclusivamente `workflow_dispatch` sobre `main`, en su environment separad
    - Después se requiere aceptación funcional IA normal y explícita, aparte.
      Mantener apagados analytics, marketing y training opcionales.
    El arnés nunca completa perfil ni acepta/simula/puentea consentimientos.
-   `baseline-login` y `upgrade-login` son parciales y no generan.
-   `full-generation` falla primero `profile_incomplete` (o
-   `profile_state_unknown` si no se observa el campo) y luego `consent_required`
+   `baseline-login` y `upgrade-login` son parciales y no solicitan turnos de chat;
+   también exigen el contrato read-only del backend antes de arrancar.
+   Con el backend compatible, `full-generation` falla primero `profile_incomplete`
+   (o `profile_state_unknown` si no se observa el campo) y luego `consent_required`
    cuando corresponda, siempre antes de pedir admisión. No es “un click” que
    autorice perfil, IA, recursos y release juntos ni se cambia política por un verde.
 5. Para candidato: el owner debe tener primero el fine-grained ContentsRW
@@ -133,6 +134,47 @@ ejecutable, además de la firma Tauri válida. Un cambio de identidad Authentico
 requiere revisión; no se lo acepta silenciosamente. Tampoco se afirma que se
 haya probado una oferta/instalación del updater: este recorrido es una
 **actualización manual NSIS**, y `updaterInstall=not-exercised`.
+
+### Backend compatible: barrera read-only anterior a NSIS y bootstrap
+
+Todos los modos requieren el health público `GET https://simon.maat.work/api/health`
+con **HTTP 200**, `ok === true`, `db === "ok"`, `liveness.status === "ok"` y
+**`capabilities.chatResume === "read-only-v1"`**. Es una capacidad del código
+del servidor: `GET /api/chat/resume` sólo lee y no precalienta/infiere. No es un
+flag configurable, permiso IA, admisión ni señal deducible de la versión del
+instalador/backend. Falta, valor desconocido/malformado, JSON inválido, HTTP no
+200, timeout o error de transporte bloquean; nunca se continúa sólo por versión.
+Se reutiliza el mismo GET público sin auth, redirects ni wake, con timeout de 3 s.
+
+El orden del arnés es explícito:
+
+1. `prepare` exige la capacidad antes de descargar/seleccionar ejecutables.
+2. `windows-install.ps1` llama al mismo gate Node **antes de `Start-Process` del
+   NSIS**, tanto para baseline como para candidato; un instalador es código
+   ejecutable y puede arrancar la app, no se presume que sea inerte.
+3. `windows-ui.cjs` vuelve a comprobarla **antes de lanzar `simon.exe`**. La sesión
+   conservada puede restaurarse apenas arranca el producto, antes del formulario
+   de contraseña; una comprobación posterior al login no protege ese bootstrap.
+4. Se comprueba de nuevo antes de cerrar sesión, navegar al login, enviar la
+   contraseña y adjuntarse al candidato. El preflight exige otro health antes de
+   la recarga que reentra en sesión/historial, y el precheck de generación lo
+   revalida antes del único click admitido.
+
+No se bloquea, sustituye ni fabrica `resume`/historial para ocultar warm-up: el
+servidor debe cumplir el contrato desde su implementación. Perfil humano,
+`consent_required`, pausa 01–08 ART, idle, first-script proof y guardian de
+telemetría siguen siendo barreras independientes, sin cambios. El preflight
+restaurado termina antes del paso que observa el issuer; salud no concede admisión.
+
+El summary conserva sólo el **último** control exitoso en `backend`: endpoint
+fijo, HTTP 200, `chatResume` exacto y frontera `checkedBefore`; no conserva el
+cuerpo health, tokens, credenciales, sesión ni historial. Un fallo posterior
+permanece bloqueante aunque exista ese control anterior.
+La revisión de fuente y las regresiones offline prueban el contrato/orden del
+arnés, **no** un run Windows, ausencia medida de inferencia ni frío físico del
+modelo. La declaración del servidor tampoco prueba por sí sola su cumplimiento
+en runtime: esa aceptación requiere evidencia independiente del owner. El
+deadline de 30 s no se convierte en prueba de generación ni de estado frío.
 
 ### Telemetría anónima: barrera anterior a scripts del producto
 
@@ -337,9 +379,9 @@ recursos ni redispatch: investigar bajo ese mismo owner.
 Sólo el JSON allowlisted se publica en el **job summary**: SHA de workflow,
 release/asset ids, hashes, clave pública Tauri, versiones, estado Authenticode,
 NSIS exit code, startup/login/generation ms, sesión fixture verificada (sin id
-de usuario/email), estado de perfil sin fecha, consentimiento existente, ACK y
-conteos de historial restaurado, status id/context/tiempos y request id opaco
-del servidor para correlación del owner.
+de usuario/email), último health/capacidad/frontera comprobados, estado de perfil
+sin fecha, consentimiento existente, ACK y conteos de historial restaurado,
+status id/context/tiempos y request id opaco del servidor para correlación del owner.
 
 No se suben logs nativos, screenshots, videos, traces, HAR, DOM, cookies,
 tokens, cuerpos de login/chat ni directorios de perfil. Errores de herramientas
@@ -357,6 +399,11 @@ como prueba de generación. Si falta esa correlación, la generación real sigue
 
 Criterios obligatorios para el owner:
 
+- **Given** health sin `read-only-v1`, desconocido/malformado o fallido, **when**
+  se pide preparar, instalar, arrancar o reentrar al login/restauración,
+  **then** se bloquea antes de NSIS/bootstrap o del click/recarga correspondiente,
+  sin llegar a la preparación/admisión de un turno. La cobertura offline del
+  handoff PowerShell no reemplaza su ejecución Windows.
 - **Given** una VM hosted nueva y el baseline pinneado, **when** se instala y
   arranca, **then** registro, versión, firma updater y ventana nativa coinciden,
   con startup ≤30 s.
@@ -373,7 +420,7 @@ Criterios obligatorios para el owner:
 - Concurrencia/orden: group único sin cancelación, attempt=1, status de un uso,
   precheck+acción en una operación. No autoriza concurrencia con otro owner.
 - Vacío/mínimos/errores: sin secretos, sin draft/firma/digest, selector ambiguo,
-  health fallido, consentimiento desconocido y deadlines fallan cerrado.
+  health/capacidad read-only fallidos, consentimiento desconocido y deadlines fallan cerrado.
 - Límites de contenido/Unicode: input de ficción fijo en español, sin imágenes,
   archivos, datos de salud o casos adversariales clínicos; esos escenarios son
   N/A para este smoke, no cobertura de seguridad clínica.
@@ -395,8 +442,10 @@ actionlint .github/workflows/offline-checks.yml .github/workflows/windows-native
 ```
 
 Agregar parse/análisis de `windows-install.ps1` en PowerShell y revisión
-independiente de refs/environment/secrets antes de merge. Los tests Node son
-regresiones offline de permisos/orden/admisión; no instalan ni generan y nunca
-sustituyen el primer run Windows real. Reportar **Pass / Fail / Blocked** con
+independiente de refs/environment/secrets antes de merge. El gate previo a NSIS
+tiene además una regresión estática del handoff PowerShell→Node, no prueba nativa.
+Los tests Node ejercitan offline salud/capacidad, orden de bootstrap/reentrada,
+permisos y admisión; no instalan ni generan y nunca sustituyen el primer run
+Windows real. Reportar **Pass / Fail / Blocked** con
 evidencia de esa corrida y mantener separados bootstrap, instalación, UI,
 inferencia y aceptación final.

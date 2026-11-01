@@ -67,7 +67,7 @@ jobs:
           node-version: '22'
           check-latest: false
 
-      - name: Pin default branch and download authenticated release assets
+      - name: Pin default branch, require read-only resume and download release assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: node .github/scripts/windows-native-qa.cjs prepare
@@ -75,6 +75,8 @@ jobs:
       - name: Install pinned desktop automation only
         run: npm ci --prefix .github/scripts --ignore-scripts --no-audit --no-fund
 
+      # Both NSIS entrypoints recheck public health/capability internally BEFORE
+      # Start-Process; an installer must not bootstrap an old generative backend.
       - name: Install real baseline NSIS 0.1.9
         run: ./.github/scripts/windows-install.ps1 -Version baseline
 
@@ -100,7 +102,8 @@ jobs:
         run: node .github/scripts/windows-ui.cjs consent
 
       # The local owner detects this exact in_progress step ONLY AFTER consent,
-      # installation and login have succeeded. Do not rename without the issuer.
+      # installation, login and read-only resume checks have succeeded.
+      # Do not rename without the issuer.
       - name: Esperar admisión de generación
         if: inputs.mode == 'full-generation'
         env:
