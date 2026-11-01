@@ -50,7 +50,6 @@ jobs:
       SIMON_QA_CANDIDATE_RELEASE_ID: ${{ inputs.candidate_release_id }}
       SIMON_QA_CANDIDATE_ASSET_ID: ${{ inputs.candidate_asset_id }}
       SIMON_QA_CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
-      SIMON_QA_ROOT: ${{ runner.temp }}\simon-windows-qa
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
 
     steps:
@@ -66,6 +65,12 @@ jobs:
         with:
           node-version: '22'
           check-latest: false
+
+      # runner.* is available to step env, not jobs.<job>.env.
+      - name: Select ephemeral runner fixture root
+        env:
+          SIMON_QA_ROOT: ${{ runner.temp }}\simon-windows-qa
+        run: Add-Content -LiteralPath $env:GITHUB_ENV -Value "SIMON_QA_ROOT=$env:SIMON_QA_ROOT" -Encoding utf8
 
       - name: Pin default branch, require read-only resume and download release assets
         env:

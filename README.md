@@ -31,6 +31,9 @@ mismos SHA completos de checkout/setup-node, `persist-credentials:false` y
 Node 22 con WebSocket global. `npm ci --ignore-scripts` exige el lockfile;
 después analiza todos los CJS y ejecuta únicamente los unit cases de contrato,
 raw-CDP e issuer.
+El workflow manual deriva `SIMON_QA_ROOT` de `runner.temp` en un **step** y
+lo transmite por `GITHUB_ENV`; ese contexto no está disponible en el `env` del
+job. La validación de GitHub del archivo no equivale a ejecutar Windows.
 
 Este carril no declara environment ni secrets, no conserva credenciales/cache,
 no descarga instaladores, no inicia la app/Playwright, no hace login ni llama
