@@ -14,3 +14,215 @@ Bajá siempre la última versión desde https://simon.maat.work/descargar.
 
 `latest.json` es el manifiesto que usa la app de escritorio para actualizarse
 sola.
+
+## QA manual de Windows (binarios instalados)
+
+Este repositorio también mantiene **sólo el arnés público de QA**, no el código
+de la aplicación. `.github/workflows/windows-native-qa.yml` no compila, publica,
+crea tags ni modifica releases. Es exclusivamente `workflow_dispatch`, usa el
+runner estándar gratuito `windows-2025` de este repositorio público y nunca
+usa el equipo/perfil de una persona, WSL, un fork privado ni recursos pagos.
+
+### Barreras antes del primer dispatch
+
+1. Revisar y mergear el workflow y sus scripts a `main`. **Bootstrap bloqueado:
+   GitHub no permite ejecutar un workflow_dispatch nuevo antes de que su archivo
+   exista en la rama por defecto. Un PR draft no prueba el workflow.**
+2. Configurar el environment **`qa-windows`** con *Selected branches and tags*:
+   **únicamente branch `main`, ningún tag**. No usar “Protected branches only”:
+   sin ramas protegidas, esa opción permite todas. Agregar revisión de owner y
+   proteger `main`/los archivos de workflow antes de cargar credenciales. El `if`
+   del YAML no puede proteger secretos si alguien edita ese mismo `if` en otra
+   rama: la restricción del environment es obligatoria, no una recomendación.
+3. El owner de cuenta prepara y verifica el fixture dedicado, no una cuenta
+   personal: id inmutable `simon-qa-native-v1`, `role=self`, clase interna `test`,
+   plan free, sin datos reales. La operación canónica de cuenta verifica las
+   exclusiones de métricas/tracking/cobros; el cliente no inventa ese marcador
+   ni obtiene permisos enviando un header. Cargar **sólo** los environment
+   secrets `SIMON_QA_EMAIL` y `SIMON_QA_PASSWORD`, después de esa verificación.
+   Nunca usar `user-login.env`, secretos de inferencia ni un PAT en Actions.
+4. El alta deja ausente el permiso funcional de IA y apagados los consentimientos
+   opcionales de analytics, marketing y training. El workflow **nunca acepta,
+   simula ni puentea un consentimiento**. `baseline-login` y `upgrade-login`
+   no generan. `full-generation` queda `consent_required` hasta que exista
+   aceptación normal explícita del owner, fuera del arnés. No se cambia esa
+   política para conseguir un verde.
+5. Para candidato: el owner debe tener primero el fine-grained ContentsRW
+   autorizado **sólo** para este repositorio; sin eso no crear tag/release.
+   Preparar posteriormente el draft `v0.1.12` y revisar los ids y SHA256 de sus
+   assets. Este workflow sólo usa el `GITHUB_TOKEN` efímero del mismo repo con
+   `contents:read` y `statuses:read`; no necesita token de publicación.
+6. Hacer la revisión y los checks offline de abajo una sola vez bajo el owner de
+   integración. Ningún dispatch ni instalación se ejecutó al agregar este arnés.
+
+### Modos y ejecución manual
+
+Desde un entorno autorizado, **no son comandos que se ejecuten automáticamente**:
+
+```sh
+# Sin candidato, sin solicitud de chat, sin admisión de generación.
+gh workflow run windows-native-qa.yml --repo Gigisanta/simon-releases \
+  --ref main -f mode=baseline-login
+
+# Consultar ids/digests del draft, sin imprimir notas ni cuerpos de aplicación.
+gh api repos/Gigisanta/simon-releases/releases \
+  --jq '.[] | select(.tag_name == "v0.1.12" and .draft) | {id, assets: [.assets[] | {id,name,digest}]}'
+
+# Sustituir con identidades revisadas, no nombres móviles ni URLs arbitrarias.
+gh workflow run windows-native-qa.yml --repo Gigisanta/simon-releases \
+  --ref main -f mode=upgrade-login \
+  -f candidate_release_id=REVIEWED_RELEASE_ID \
+  -f candidate_asset_id=REVIEWED_INSTALLER_ASSET_ID \
+  -f candidate_sha256=REVIEWED_64_LOWERCASE_HEX_SHA256
+```
+
+`baseline-login` instala el NSIS público 0.1.9 pinneado por release id, asset id y
+SHA256. `upgrade-login`/`full-generation` instalan primero ese mismo baseline,
+lo arrancan e ingresan por su UI, lo cierran y ejecutan el **NSIS original** del
+candidato sobre **el mismo directorio**, sin desinstalar ni limpiar sus datos.
+Se verifican el registro NSIS y el recurso de versión de `simon.exe` después
+de cada instalación; el proceso arrancado se vincula a ese path y a una ventana
+Win32 real. Se conserva el mismo directorio WebView2 y se registra si hubo
+restauración de sesión; después se hace también login real con contraseña.
+
+Las descargas usan ids del mismo repo, checksums de GitHub y firma criptográfica
+Tauri/minisign del instalador contra la clave pública ya distribuida en 0.1.9,
+incluido su comentario firmado de versión. `latest.json` debe corresponder a la
+misma firma/versión/URL. El draft se relee antes de ejecutar y antes de generar.
+Un candidato publicado, una selección ambigua, una sustitución de asset, un
+checksum/firma distinto o una rama/SHA que ya no sea el `main` actual bloquean.
+
+**Firma de updater ≠ Authenticode:** estos binarios Windows salen sin certificado
+de firma de código de pago. Se exige y registra `NotSigned` para instalador y
+ejecutable, además de la firma Tauri válida. Un cambio de identidad Authenticode
+requiere revisión; no se lo acepta silenciosamente. Tampoco se afirma que se
+haya probado una oferta/instalación del updater: este recorrido es una
+**actualización manual NSIS**, y `updaterInstall=not-exercised`.
+
+### Generación: UI real y admisión externa
+
+`windows-ui.cjs` inicia el **ejecutable instalado**, habilita el CDP de su
+WebView2 sólo en loopback y usa `playwright-core` contra esa ventana. No inicia
+Chromium, no abre la web en lugar de la app y no sustituye login/chat por API.
+Los únicos fetch directos a la aplicación son `GET /api/health`. Las lecturas
+de sesión/consentimiento son observaciones de las solicitudes que hace la propia
+UI nativa. Se exige la sesión del id fixture y rol exactos; el email del login
+se compara en memoria sin persistirlo.
+
+Para `full-generation`, usar los mismos ids/checksum y cambiar sólo el modo.
+El paso `Check normal AI consent without accepting it` tiene que terminar antes
+de llegar al paso exacto **`Esperar admisión de generación`** del job
+`windows-native`. Sin consentimiento existente o composer habilitado, falla
+cerrado sin enviar y sin pedir una admisión.
+
+El runner no puede medir los recursos de la máquina que aloja la inferencia.
+El owner local debe usar el contrato canónico `docs/qa-admission.md` y la
+operación persistente `.github/scripts/admitted-action.cjs` del checkout fuente
+revisado, **dentro del resource guard apropiado**, y observar el paso exacto
+`in_progress` de esta corrida. Su precheck vivo conserva por separado banco,
+quiet, tráfico, `gpu_hold`, coordinación/propiedad y la ventana fuera de
+**01:00–08:00 ART**. No se quita un hold ajeno ni se transmite autenticación
+de inferencia a Actions.
+
+Después de ese precheck, el issuer local crea **una sola vez** un commit status
+sobre el `github.sha` de la corrida:
+
+| Campo | Contrato exacto |
+|---|---|
+| `context` | `qa-windows/admission/<run_id>/<run_attempt>` |
+| `state` | `success` |
+| `creator.login` observado | `Gigisanta` |
+| `description` | `<candidate installer SHA256 lowercase>:<expiresEpoch de 10 dígitos>` (75 caracteres) |
+| `target_url` | `https://github.com/Gigisanta/simon-releases/actions/runs/<run_id>/attempts/<run_attempt>` |
+| Frescura | edad no negativa y ≤10 s; expira entre ahora+30 s y created_at+45 s |
+
+El owner conserva su **guard real** hasta estado terminal del run y comprueba
+que no quede trabajo de backend antes de liberarlo. **El status no crea ni
+prueba un lease y no concede exclusividad**; sólo es el handoff autenticado
+de ese owner. La admisión por sí sola tampoco reemplaza un precheck fresco.
+Si el issuer falla o su resultado es desconocido, no publica success ni
+continúa el envío por otro camino.
+
+El runner espera como máximo 10 minutos. Exige exactamente un status del
+contexto, rechaza otro creador/run/attempt/hash, duplicados, expirados o fechas
+futuras, y rechaza re-runs (`run_attempt` debe ser 1). Mediante su propia
+operación persistente vuelve a comprobar rama/draft, health, consentimiento,
+status y ART inmediatamente antes del único click. Verifica de nuevo frescura
+en la interceptación del POST real para no gastar la vigencia esperando
+actionability de la UI. No hay retries ni una segunda solicitud permitida.
+
+El input es fijo, sintético y no sensible: una oración de ficción sobre una
+cometa violeta de papel. El arnés valida que el POST nativo lleve exactamente
+ese input y los ids de protocolo; deja salir una sola solicitud y exige HTTP
+200, respuesta no vacía acorde al ejercicio y su texto exacto renderizado en
+una nueva burbuja de la UI. El plazo total desde el click hasta render es
+**30 s**. Al vencer desconecta ese cliente; el resultado queda incierto/fallido,
+nunca PASS. El owner sigue siendo responsable de confirmar settlement del
+backend antes de liberar recursos. No redispatch/reintento automático para
+reparar una solicitud incierta.
+
+### Evidencia y aceptación
+
+Sólo el JSON allowlisted se publica en el **job summary**: SHA de workflow,
+release/asset ids, hashes, clave pública Tauri, versiones, estado Authenticode,
+NSIS exit code, startup/login/generation ms, sesión fixture verificada (sin id
+de usuario/email), consentimiento existente, conteos, status id/context/tiempos
+y request id opaco del servidor para correlación del owner.
+
+No se suben logs nativos, screenshots, videos, traces, HAR, DOM, cookies,
+tokens, cuerpos de login/chat ni directorios de perfil. Errores de herramientas
+se convierten a códigos fijos; no se imprime el mensaje/stack de Playwright.
+No se usan artifacts de Actions ni caches con estado autenticado.
+
+Un job verde no es aprobación de release. El JSON declara
+`releaseAcceptance=not-claimed` y `providerEvidence=owner-correlation-required`:
+la UI prueba envío/respuesta/render reales, no demuestra por sí sola qué
+proveedor/modelo ejecutó el backend. El owner correlaciona el request id con
+evidencia de inferencia existente y su guard; no acepta una plantilla/fallback
+como prueba de generación. Si falta esa correlación, la generación real sigue
+**sin verificar**. Baseline/upgrade-login siempre dejan
+`generation.state=not-requested`.
+
+Criterios obligatorios para el owner:
+
+- **Given** una VM hosted nueva y el baseline pinneado, **when** se instala y
+  arranca, **then** registro, versión, firma updater y ventana nativa coinciden,
+  con startup ≤30 s.
+- **Given** el fixture exclusivo, **when** se envía el formulario de login nativo,
+  **then** sesión `self` correcta y chat visible en ≤30 s, sin aceptar permisos.
+- **Given** 0.1.9 instalado, **when** corre el NSIS del draft 0.1.12, **then**
+  cambia la versión del mismo directorio y la UI nativa del candidato ingresa.
+- **Given** consentimiento ausente/admisión inválida, **when** se pide full,
+  **then** cero POSTs de chat salen y el motivo bloqueante es explícito.
+- **Given** consentimiento normal previo, guard externo vigente y status fresco,
+  **when** se hace el único click autorizado, **then** exactamente un POST
+  sintético y respuesta renderizada ≤30 s; el owner aporta además inferencia
+  correlacionada. Timeout/cualquier incertidumbre bloquea aceptación.
+- Concurrencia/orden: group único sin cancelación, attempt=1, status de un uso,
+  precheck+acción en una operación. No autoriza concurrencia con otro owner.
+- Vacío/mínimos/errores: sin secretos, sin draft/firma/digest, selector ambiguo,
+  health fallido, consentimiento desconocido y deadlines fallan cerrado.
+- Límites de contenido/Unicode: input de ficción fijo en español, sin imágenes,
+  archivos, datos de salud o casos adversariales clínicos; esos escenarios son
+  N/A para este smoke, no cobertura de seguridad clínica.
+- Compatibilidad: actualización manual sobre 0.1.9 con datos conservados;
+  updater-offer e instalación automática son N/A, no se ejercitan aquí.
+- Telemetría/cobros: el owner de cuenta verifica exclusión por marker actual de
+  DB y consents opcionales apagados; el summary de UI no sustituye esa prueba.
+
+Checks que debe ejecutar el integrador, **no ejecutados al preparar este cambio**:
+
+```sh
+node --check .github/scripts/windows-contract.cjs
+node --check .github/scripts/windows-native-qa.cjs
+node --check .github/scripts/windows-ui.cjs
+node --test .github/scripts/windows-contract.test.cjs
+actionlint .github/workflows/windows-native-qa.yml
+```
+
+Agregar parse/análisis de `windows-install.ps1` en PowerShell y revisión
+independiente de refs/environment/secrets antes de merge. Los tests Node son
+regresiones offline de permisos/orden/admisión; no instalan ni generan y nunca
+sustituyen el primer run Windows real. Reportar **Pass / Fail / Blocked** con
+evidencia de esa corrida y mantener separados bootstrap, instalación, UI,
+inferencia y aceptación final.
