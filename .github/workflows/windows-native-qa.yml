@@ -1,0 +1,124 @@
+name: Windows native QA
+run-name: Windows native QA · ${{ inputs.mode }} · ${{ github.run_id }}
+
+# This public binary repository never checks out the private application source.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'baseline-login = 0.1.9 only; upgrade-login = manual NSIS upgrade; full-generation = one admitted UI turn'
+        type: choice
+        default: baseline-login
+        options: [baseline-login, upgrade-login, full-generation]
+        required: true
+      candidate_release_id:
+        description: 'Exact SAME-repo draft v0.1.12 release id (empty for baseline-login)'
+        type: string
+      candidate_asset_id:
+        description: 'Exact Simon-setup.exe asset id in that draft'
+        type: string
+      candidate_sha256:
+        description: 'Reviewed installer SHA256, 64 lowercase hex characters'
+        type: string
+
+permissions:
+  contents: read
+  statuses: read
+
+concurrency:
+  group: qa-windows-native
+  cancel-in-progress: false
+
+jobs:
+  windows-native:
+    # Also configure qa-windows deployment branches as SELECTED branch main,
+    # not "protected branches only" (which permits all when none are protected).
+    if: >-
+      github.repository == 'Gigisanta/simon-releases' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.workflow_ref == 'Gigisanta/simon-releases/.github/workflows/windows-native-qa.yml@refs/heads/main' &&
+      github.run_attempt == 1
+    runs-on: windows-2025
+    timeout-minutes: 25
+    environment: qa-windows
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      SIMON_QA_MODE: ${{ inputs.mode }}
+      SIMON_QA_CANDIDATE_RELEASE_ID: ${{ inputs.candidate_release_id }}
+      SIMON_QA_CANDIDATE_ASSET_ID: ${{ inputs.candidate_asset_id }}
+      SIMON_QA_CANDIDATE_SHA256: ${{ inputs.candidate_sha256 }}
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+
+    steps:
+      - name: Checkout reviewed public workflow commit
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Select supported Node runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          check-latest: false
+
+      # runner.* is available to step env, not jobs.<job>.env.
+      - name: Select ephemeral runner fixture root
+        env:
+          SIMON_QA_ROOT: ${{ runner.temp }}\simon-windows-qa
+        run: Add-Content -LiteralPath $env:GITHUB_ENV -Value "SIMON_QA_ROOT=$env:SIMON_QA_ROOT" -Encoding utf8
+
+      - name: Pin default branch, require read-only resume and download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/windows-native-qa.cjs prepare
+
+      - name: Install pinned desktop automation only
+        run: npm ci --prefix .github/scripts --ignore-scripts --no-audit --no-fund
+
+      # Both NSIS entrypoints recheck public health/capability internally BEFORE
+      # Start-Process; an installer must not bootstrap an old generative backend.
+      - name: Install real baseline NSIS 0.1.9
+        run: ./.github/scripts/windows-install.ps1 -Version baseline
+
+      - name: Baseline native startup and real UI login
+        env:
+          SIMON_QA_EMAIL: ${{ secrets.SIMON_QA_EMAIL }}
+          SIMON_QA_PASSWORD: ${{ secrets.SIMON_QA_PASSWORD }}
+        run: node .github/scripts/windows-ui.cjs login baseline
+
+      - name: Upgrade same installation with real candidate NSIS
+        if: inputs.mode != 'baseline-login'
+        run: ./.github/scripts/windows-install.ps1 -Version candidate
+
+      - name: Candidate native startup and real UI login
+        if: inputs.mode != 'baseline-login'
+        env:
+          SIMON_QA_EMAIL: ${{ secrets.SIMON_QA_EMAIL }}
+          SIMON_QA_PASSWORD: ${{ secrets.SIMON_QA_PASSWORD }}
+        run: node .github/scripts/windows-ui.cjs login candidate
+
+      - name: Check normal AI consent without accepting it
+        if: inputs.mode == 'full-generation'
+        run: node .github/scripts/windows-ui.cjs consent
+
+      # The local owner detects this exact in_progress step ONLY AFTER consent,
+      # installation, login and read-only resume checks have succeeded.
+      # Do not rename without the issuer.
+      - name: Esperar admisión de generación
+        if: inputs.mode == 'full-generation'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node .github/scripts/windows-ui.cjs generate
+
+      - name: Stop only this ephemeral runner's native process
+        if: always()
+        run: node .github/scripts/windows-native-qa.cjs cleanup
+
+      - name: Publish allowlisted evidence only
+        if: always()
+        run: node .github/scripts/windows-native-qa.cjs summarize
