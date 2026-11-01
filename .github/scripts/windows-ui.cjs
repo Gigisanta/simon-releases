@@ -10,6 +10,10 @@ const {
   checkAdmission, checkRelease, outsideQuietWindow,
 } = require("./windows-contract.cjs");
 const { root, readJson, writeJson, record, githubJson, health, assertTrustedRun, stopNative, cli } = require("./windows-native-qa.cjs");
+const {
+  profileStateFromSession, assertGenerationPrerequisites, waitForGenerationComposer,
+  waitForHistoryRestored, snapshotAndClickOnce,
+} = require("./windows-ui-lifecycle.cjs");
 
 const ORIGIN = "https://tauri.localhost";
 const API = "https://simon.maat.work";
@@ -22,6 +26,11 @@ const remaining = (deadline) => {
 function isApi(response, pathname) {
   const url = new URL(response.url());
   return url.origin === API && url.pathname === pathname && !url.search;
+}
+function isResume(response) {
+  const url = new URL(response.url());
+  return url.origin === API && url.pathname === "/api/chat/resume" && url.search === "?allowOrphan=1" &&
+    response.request().method() === "GET";
 }
 function isNative(page) {
   try { return new URL(page.url()).origin === ORIGIN; } catch { return false; }
@@ -210,7 +219,8 @@ async function login(label) {
   await page.getByRole("button", { name: "Entrar", exact: true }).click({ timeout: remaining(deadline) });
   const [signInResponse, sessionResponse] = await Promise.all([signIn, session]);
   requireThat(signInResponse.status() === 200 && sessionResponse.status() === 200, "ui_login_rejected");
-  checkFixture(await sessionResponse.json(), email);
+  const sessionBody = await sessionResponse.json();
+  checkFixture(sessionBody, email);
   await page.getByRole("heading", { name: "Chat con Simón", exact: true })
     .waitFor({ state: "visible", timeout: remaining(deadline) });
   const consentResponse = await consent;
@@ -225,6 +235,7 @@ async function login(label) {
     state: "completed", version: selection[label].version, startupMs, loginMs: Date.now() - loginStarted,
     nativeWindow: "verified", nativeWebView: "installed-webview2-cdp", login: "native-ui-password",
     fixture: "immutable-test-self", restoredSession, aiConsentGranted: consentBody.consent.granted,
+    profileState: profileStateFromSession(sessionBody),
     chatRequests: 0, updaterOffer: "not-asserted", updaterInstall: "not-exercised",
     telemetry,
   });
@@ -237,21 +248,43 @@ async function existingPage() {
   requireThat(state.label === "candidate", "candidate_not_running");
   return await attach(state, Date.now() + DEADLINE_MS);
 }
-async function requireConsent(page) {
-  const evidence = await readJson("evidence.json");
-  requireThat(evidence.loginCandidate?.state === "completed" && evidence.loginCandidate.aiConsentGranted === true,
-    "consent_required");
-  const composer = page.getByRole("textbox", { name: "Escribí tu mensaje", exact: true });
-  requireThat(await composer.count() === 1 && await composer.isVisible() && await composer.isEnabled(), "consent_required");
-  return composer;
-}
 async function consent() {
   const { page, context, nativeState } = await existingPage();
   const noChat = await chatBlocker(context);
-  await requireConsent(page);
+  const evidence = await readJson("evidence.json");
+  requireThat(evidence.loginCandidate?.state === "completed", "candidate_login_missing");
+  // An empty self profile is NOT authorization to assert identity/18+/DNI.
+  // Fail before the ready/admission step, even if IA was separately granted.
+  assertGenerationPrerequisites(evidence.loginCandidate);
+  const deadline = Date.now() + DEADLINE_MS;
+  const freshSession = page.waitForResponse((response) => isApi(response, "/api/auth/get-session") &&
+    response.request().method() === "GET", { timeout: remaining(deadline) });
+  const freshConsent = page.waitForResponse((response) => isApi(response, "/api/user/ai-consent") &&
+    response.request().method() === "GET", { timeout: remaining(deadline) });
+  const freshHistory = page.waitForResponse(isResume, { timeout: remaining(deadline) });
+  for (const observation of [freshSession, freshConsent, freshHistory]) observation.catch(() => {});
+  // These are requests made by the actual installed UI. The harness does not
+  // call auth/profile/consent/history endpoints or click any grant/retry.
+  await page.reload({ timeout: remaining(deadline) });
+  const [sessionResponse, consentResponse] = await Promise.all([freshSession, freshConsent]);
+  requireThat(sessionResponse.status() === 200, "qa_fixture_session_mismatch");
+  const sessionBody = await sessionResponse.json();
+  checkFixture(sessionBody);
+  requireThat(consentResponse.status() === 200, "consent_state_unknown");
+  const consentBody = await consentResponse.json();
+  const prerequisites = { profileState: profileStateFromSession(sessionBody),
+    aiConsentGranted: consentBody?.consent?.granted };
+  await waitForGenerationComposer(page, prerequisites, deadline);
+  const history = await waitForHistoryRestored(page, freshHistory, deadline);
   await telemetryEvidence(page, nativeState);
+  remaining(deadline);
   noChat();
-  await record("consent", { state: "already-granted-by-owner", grantedByWorkflow: false });
+  await writeJson("ui-ready.json", {
+    schema: "simon-generation-ui-ready/v1", nativePid: nativeState.pid, guardBootId: nativeState.guardBootId,
+    ...prerequisites, history,
+  });
+  await record("consent", { state: "already-granted-by-owner", grantedByWorkflow: false,
+    profileState: prerequisites.profileState, profileCompletedByWorkflow: false, history });
 }
 async function statuses() {
   const all = [];
@@ -277,22 +310,11 @@ async function waitForAdmission(candidateSha) {
 async function generate() {
   requireThat(process.env.SIMON_QA_MODE === "full-generation" && process.env.GITHUB_RUN_ATTEMPT === "1", "generation_not_authorized");
   const { page, context, nativeState } = await existingPage();
-  const composer = await requireConsent(page);
+  const ready = await readJson("ui-ready.json");
+  requireThat(ready.schema === "simon-generation-ui-ready/v1" && ready.nativePid === nativeState.pid &&
+    ready.guardBootId === nativeState.guardBootId, "ui_preflight_stale");
+  const composer = await waitForGenerationComposer(page, ready, Date.now() + DEADLINE_MS);
   const selection = await readJson("selection.json");
-  // Reload the actual installed WebView through CDP so the normal native
-  // session/consent reads are fresh. Never invoke those APIs from the harness.
-  const freshSession = page.waitForResponse((response) => isApi(response, "/api/auth/get-session") &&
-    response.request().method() === "GET", { timeout: DEADLINE_MS });
-  const freshConsent = page.waitForResponse((response) => isApi(response, "/api/user/ai-consent") &&
-    response.request().method() === "GET", { timeout: DEADLINE_MS });
-  for (const observation of [freshSession, freshConsent]) observation.catch(() => {});
-  await page.reload({ timeout: DEADLINE_MS });
-  const [sessionResponse, consentResponse] = await Promise.all([freshSession, freshConsent]);
-  requireThat(sessionResponse.status() === 200, "qa_fixture_session_mismatch");
-  checkFixture(await sessionResponse.json());
-  requireThat(consentResponse.status() === 200 && (await consentResponse.json())?.consent?.granted === true,
-    "consent_required");
-  await requireConsent(page);
   await telemetryEvidence(page, nativeState);
   requireThat(selection.candidate?.version === "0.1.12", "candidate_identity_missing");
   let armed = false;
@@ -325,8 +347,8 @@ async function generate() {
   });
   await composer.fill(PROMPT);
   const send = page.getByRole("button", { name: "Enviar mensaje", exact: true });
-  requireThat(await send.count() === 1 && await send.isEnabled(), "send_control_unavailable");
-  const assistantsBefore = await page.locator('[role="log"] [data-role="assistant"]').count();
+  await send.and(page.locator(":enabled")).waitFor({ state: "visible", timeout: DEADLINE_MS });
+  requireThat(await send.count() === 1, "send_control_unavailable");
   const admission = await waitForAdmission(selection.candidate.sha256);
   let elapsedMs;
   let requestId;
@@ -338,7 +360,7 @@ async function generate() {
       checkRelease(liveRelease, selection.candidate, true);
       await health();
       await telemetryEvidence(page, nativeState);
-      await requireConsent(page);
+      await waitForGenerationComposer(page, ready, Date.now() + DEADLINE_MS);
       finalStatuses = await statuses();
       const fresh = checkAdmission(finalStatuses, process.env, selection.candidate.sha256);
       requireThat(fresh.id === admission.id && attempts === 0, "admission_identity_changed");
@@ -364,7 +386,7 @@ async function generate() {
       });
       try {
         await Promise.race([(async () => {
-          await send.click({ timeout: remaining(deadline) }); // exactly one UI send, never retry
+          const assistantsBefore = await snapshotAndClickOnce(page, send, ready.history, deadline);
           const response = await responsePromise;
           requireThat(response.status() === 200 && !routeFailure && dispatched === 1 && attempts === 1,
             "ui_generation_http_failed");

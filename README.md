@@ -64,12 +64,22 @@ sigue exclusivamente `workflow_dispatch` sobre `main`, en su environment separad
    La única copia local de credenciales es
    `~/.hermes/project-env/HerMaatOS/work/simon-ai/qa-windows.env`, modo `0600`;
    nunca imprimirla ni adjuntarla. El issuer de admisión no la necesita.
-4. El alta deja ausente el permiso funcional de IA y apagados los consentimientos
-   opcionales de analytics, marketing y training. El workflow **nunca acepta,
-   simula ni puentea un consentimiento**. `baseline-login` y `upgrade-login`
-   no generan. `full-generation` queda `consent_required` hasta que exista
-   aceptación normal explícita del owner, fuera del arnés. No se cambia esa
-   política para conseguir un verde.
+4. El seed `self` deja **perfil de identidad vacío** (`profileCompletedAt=null`)
+   y permiso funcional de IA ausente. Son requisitos humanos **separados**:
+   - Primero el owner debe revisar y autorizar el flujo web normal
+     `/completar-perfil`: pide identidad, confirmación 18+ y check de DNI. El
+     selector nativo `/perfil` no completa esa identidad y la app no incluye
+     `/completar-perfil`. No inventar datos, declaraciones ni defaults; no usar
+     identidad de Gio ni datos reales. Si no existe un procedimiento QA legítimo
+     autorizado compatible con esas restricciones, **full sigue bloqueado**.
+   - Después se requiere aceptación funcional IA normal y explícita, aparte.
+     Mantener apagados analytics, marketing y training opcionales.
+   El arnés nunca completa perfil ni acepta/simula/puentea consentimientos.
+   `baseline-login` y `upgrade-login` son parciales y no generan.
+   `full-generation` falla primero `profile_incomplete` (o
+   `profile_state_unknown` si no se observa el campo) y luego `consent_required`
+   cuando corresponda, siempre antes de pedir admisión. No es “un click” que
+   autorice perfil, IA, recursos y release juntos ni se cambia política por un verde.
 5. Para candidato: el owner debe tener primero el fine-grained ContentsRW
    autorizado **sólo** para este repositorio; sin eso no crear tag/release.
    Preparar posteriormente el draft `v0.1.12` y revisar los ids y SHA256 de sus
@@ -190,15 +200,36 @@ tracker intentó enviar ni que la instrumentación haya sido ejercitada.
 WebView2 sólo en loopback y usa `playwright-core` contra esa ventana. No inicia
 Chromium, no abre la web en lugar de la app y no sustituye login/chat por API.
 Los únicos fetch directos a la aplicación son `GET /api/health`. Las lecturas
-de sesión/consentimiento son observaciones de las solicitudes que hace la propia
-UI nativa. Se exige la sesión del id fixture y rol exactos; el email del login
+de sesión/estado de perfil, consentimiento e historial son observaciones de
+solicitudes de la propia UI nativa. Se exige el id fixture y rol exactos; el email
 se compara en memoria sin persistirlo.
 
 Para `full-generation`, usar los mismos ids/checksum y cambiar sólo el modo.
-El paso `Check normal AI consent without accepting it` tiene que terminar antes
-de llegar al paso exacto **`Esperar admisión de generación`** del job
-`windows-native`. Sin consentimiento existente o composer habilitado, falla
-cerrado sin enviar y sin pedir una admisión.
+El paso de nombre histórico `Check normal AI consent without accepting it`
+comprueba ahora **perfil + IA + UI restaurada**, antes del paso exacto
+**`Esperar admisión de generación`** del job `windows-native`. Lee
+`profileCompletedAt` de la respuesta normal `get-session`, publica sólo su
+estado completo/incompleto/desconocido y nunca lo escribe ni publica su fecha.
+Un perfil incompleto bloquea incluso si IA fue otorgada por separado.
+
+La respuesta IA puede llegar antes del commit de React: el arnés espera de forma
+acotada el composer **visible y habilitado**, no decide `consent_required` con
+un `count/isVisible/isEnabled` instantáneo. Falta de grant y falta de readiness
+siguen siendo resultados distintos; no se acepta un consentimiento para avanzar.
+
+El preflight recarga la ventana instalada y observa, sin llamar desde el arnés,
+`GET /api/chat/resume?allowOrphan=1`. Espera tanto cuerpo HTTP como restauración
+de las burbujas por rol/texto en la UI; para historial vacío exige el estado vacío
+ya comprobado, no sólo cero burbujas mientras carga. Error de resume o turno
+pendiente/orphan bloquea: no se pulsa Reintentar ni se reutiliza un envío incierto.
+Sólo se guardan conteos y ACK de restauración en un handoff privado ligado al
+PID/boot actual; nunca cuerpos, títulos ni ids de historial.
+
+Generación no vuelve a recargar después del preflight. Tras esperar admisión y
+el precheck final, toma el conteo de asistentes **adyacente al único click
+admitido**, dentro del deadline de 30 s. Si cambió desde la restauración,
+falla antes del click en vez de consumir el turno y dar luego un falso timeout.
+Un click parcialmente entregado tampoco se reintenta automáticamente.
 
 El runner no puede medir los recursos de la máquina que aloja la inferencia.
 El owner local debe usar el contrato canónico `docs/qa-admission.md` y la
@@ -286,8 +317,9 @@ recursos ni redispatch: investigar bajo ese mismo owner.
 Sólo el JSON allowlisted se publica en el **job summary**: SHA de workflow,
 release/asset ids, hashes, clave pública Tauri, versiones, estado Authenticode,
 NSIS exit code, startup/login/generation ms, sesión fixture verificada (sin id
-de usuario/email), consentimiento existente, conteos, status id/context/tiempos
-y request id opaco del servidor para correlación del owner.
+de usuario/email), estado de perfil sin fecha, consentimiento existente, ACK y
+conteos de historial restaurado, status id/context/tiempos y request id opaco
+del servidor para correlación del owner.
 
 No se suben logs nativos, screenshots, videos, traces, HAR, DOM, cookies,
 tokens, cuerpos de login/chat ni directorios de perfil. Errores de herramientas
