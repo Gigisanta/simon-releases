@@ -1,0 +1,47 @@
+name: Offline contract checks
+
+# Untrusted PR code is allowed only in this secretless, unprivileged lane.
+# This is not Windows QA, environment approval or release authorization.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  offline-policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout public PR merge commit without persisted credentials
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Select Node with built-in WebSocket
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          check-latest: false
+
+      - name: Install frozen public dependencies without lifecycle scripts
+        run: npm ci --prefix .github/scripts --ignore-scripts --no-audit --no-fund
+
+      - name: Parse every public CJS helper and test without executing it
+        run: |
+          for file in .github/scripts/*.cjs; do
+            node --check "$file"
+          done
+
+      - name: Run offline contract, raw-CDP and issuer unit cases only
+        run: >-
+          node --test
+          .github/scripts/windows-contract.test.cjs
+          .github/scripts/windows-cdp-guard.test.cjs
+          .github/scripts/windows-admit-owner.test.cjs

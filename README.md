@@ -23,11 +23,31 @@ crea tags ni modifica releases. Es exclusivamente `workflow_dispatch`, usa el
 runner estándar gratuito `windows-2025` de este repositorio público y nunca
 usa el equipo/perfil de una persona, WSL, un fork privado ni recursos pagos.
 
+### CI offline del PR (sin credenciales)
+
+`.github/workflows/offline-checks.yml` ejecuta **sólo `pull_request` hacia `main`**
+en el runner estándar gratuito `ubuntu-24.04`, con `contents:read`. Usa los
+mismos SHA completos de checkout/setup-node, `persist-credentials:false` y
+Node 22 con WebSocket global. `npm ci --ignore-scripts` exige el lockfile;
+después analiza todos los CJS y ejecuta únicamente los unit cases de contrato,
+raw-CDP e issuer.
+
+Este carril no declara environment ni secrets, no conserva credenciales/cache,
+no descarga instaladores, no inicia la app/Playwright, no hace login ni llama
+al gateway/modelo. No usa `pull_request_target`, `workflow_run`, código privado
+ni ejecución privilegiada. Puede producir evidencia CI del PR antes del merge,
+sin ejecutar ni aprobar el workflow manual de Windows.
+**Offline CI PASS ≠ Windows QA PASS, aprobación de `qa-windows`, consentimiento,
+admisión de GPU o autorización de release.** El arnés Windows con credenciales
+sigue exclusivamente `workflow_dispatch` sobre `main`, en su environment separado.
+
+
 ### Barreras antes del primer dispatch
 
-1. Revisar y mergear el workflow y sus scripts a `main`. **Bootstrap bloqueado:
-   GitHub no permite ejecutar un workflow_dispatch nuevo antes de que su archivo
-   exista en la rama por defecto. Un PR draft no prueba el workflow.**
+1. Revisar y mergear el workflow Windows y sus scripts a `main`.
+   **Bootstrap manual Windows bloqueado:** GitHub no permite ejecutar un
+   workflow_dispatch nuevo antes de que exista en la rama por defecto. La CI
+   offline del PR sí es independiente; su resultado no prueba el workflow Windows.
 2. Configurar el environment **`qa-windows`** con *Selected branches and tags*:
    **únicamente branch `main`, ningún tag**. No usar “Protected branches only”:
    sin ramas protegidas, esa opción permite todas. Agregar revisión de owner y
@@ -313,17 +333,13 @@ Criterios obligatorios para el owner:
   a scripts observada en Windows real y correlación del owner, no sólo el hook
   escrito o un contador cero. `zeroFootprint=not-claimed` no desaparece.
 
-Checks que debe ejecutar el integrador, **no ejecutados al preparar este cambio**:
+La CI del PR define los checks Node de abajo. El integrador agrega `actionlint`
+según el gate acordado; **ninguno se ejecutó localmente al preparar este cambio**:
 
 ```sh
-node --check .github/scripts/windows-contract.cjs
-node --check .github/scripts/windows-native-qa.cjs
-node --check .github/scripts/windows-ui.cjs
-node --check .github/scripts/windows-cdp-guard.cjs
-node --check .github/scripts/windows-telemetry-guard.cjs
-node --check .github/scripts/windows-admit-owner.cjs
+for file in .github/scripts/*.cjs; do node --check "$file"; done
 node --test .github/scripts/windows-contract.test.cjs .github/scripts/windows-cdp-guard.test.cjs .github/scripts/windows-admit-owner.test.cjs
-actionlint .github/workflows/windows-native-qa.yml
+actionlint .github/workflows/offline-checks.yml .github/workflows/windows-native-qa.yml
 ```
 
 Agregar parse/análisis de `windows-install.ps1` en PowerShell y revisión
