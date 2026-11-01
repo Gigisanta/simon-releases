@@ -303,10 +303,30 @@ ni copiar un hold ajeno para “admitirlo”. `MAAT_HOLD_OWNER` y `MAAT_HOLD_TOK
 deben ser los que posee ese mismo guard y corresponder al hold vivo de 8080.
 No se transfiere el token ni una API key de inferencia a Actions.
 
+El nombre público del owner y la presencia de una variable **no prueban**
+ownership. Antes de admitir, el issuer autentica la capacidad contra el gateway
+vivo con dos challenges locales a `/v1/chat/completions`, ambos con body JSON
+`null`: un token deliberadamente distinto debe recibir
+`403/invalid_gpu_hold_credentials`; el token propio debe llegar luego a
+`400/invalid_json`. Esa combinación acredita el orden auth→validación del body.
+No contiene modelo/prompt ni puede alcanzar resolución de modelo, cola, wake
+o generación. Si el protocolo cambia o hay cualquier resultado desconocido,
+se bloquea; nunca se adquiere, renueva, libera ni adopta un hold desde el issuer.
+No se imprime ni persiste el token.
+
+El último precheck también lee los archivos canónicos privados, sin overrides:
+`var/bench-window.lock` debe estar ausente o válidamente vencido (cualquier
+reserva activa, incluso homónima, bloquea); `var/ci-quiet.json` debe tener
+actualización de como máximo 60 s, estado `off`, owner `null` y runners
+`running|off`. Un archivo ilegible, symlink, permiso abierto, esquema desconocido,
+estado futuro/stale o proceso `Runner.Worker` activo bloquea antes del status.
+No pausa, drena, reactiva ni modifica runners/locks; debe esperar su turno real.
+
 El issuer usa el `gh` local ya autorizado del owner, exige creator `Gigisanta`,
 main/SHA revisados y el paso exacto en progreso. Espera como máximo 10 min y
-vuelve a comprobar health/stats, quiet/maintenance/admisión/hold propio y ART
-dentro de `admitted-action.cjs`. Antes del único POST persiste y sincroniza el
+vuelve a autenticar el lease y comprobar banco/CI quiet, health/stats,
+maintenance/admisión/hold propio y ART dentro de `admitted-action.cjs`.
+Antes del único POST de status persiste y sincroniza el
 estado incierto en el recibo; un error o resultado desconocido **no se reintenta**.
 Conserva la operación/guard hasta estado terminal del run de ese SHA y dos
 snapshots quiet de settlement. Si no se puede demostrar settlement, no liberar

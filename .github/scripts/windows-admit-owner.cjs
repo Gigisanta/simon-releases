@@ -2,20 +2,27 @@
 
 // Run locally INSIDE the canonical gpu-heavy resource_guard, never in Actions.
 const { execFileSync } = require("node:child_process");
-const { openSync, writeSync, ftruncateSync, fsyncSync, closeSync, lstatSync } = require("node:fs");
+const { constants, openSync, readSync, writeSync, fstatSync, ftruncateSync, fsyncSync, closeSync, lstatSync } = require("node:fs");
 const { dirname, isAbsolute } = require("node:path");
 const admittedAction = require("./admitted-action.cjs");
 const { REPO, CANDIDATE_VERSION, numericId, requireThat, outsideQuietWindow, checkRelease } = require("./windows-contract.cjs");
 const READY_STEP = "Esperar admisión de generación";
 const WORKFLOW_PATH = ".github/workflows/windows-native-qa.yml";
+const CANONICAL_ROOT = "/Users/gigi/HerMaatOS";
+function leaseCredentials(env) {
+  const owner = env.MAAT_HOLD_OWNER;
+  const token = env.MAAT_HOLD_TOKEN;
+  requireThat(/^resource_guard_[0-9]+_[a-f0-9]{8}$/.test(owner ?? "") &&
+    /^[A-Za-z0-9_-]{24,64}$/.test(token ?? ""), "guard_environment_missing");
+  return { owner, token };
+}
 function guardState(health, stats, env = process.env, now = Date.now(), { forGeneration = true } = {}) {
   if (forGeneration) outsideQuietWindow(now);
-  const owner = env.MAAT_HOLD_OWNER;
-  requireThat(/^resource_guard_[0-9]+_[a-f0-9]{8}$/.test(owner ?? "") &&
-    typeof env.MAAT_HOLD_TOKEN === "string" && env.MAAT_HOLD_TOKEN.length >= 24, "guard_environment_missing");
+  const { owner } = leaseCredentials(env);
   const gpu = stats?.gpu_turns;
   requireThat(health?.status === "ok" && !health.reason && gpu?.lease_protected === true &&
-    gpu.hold_who === owner && gpu.hold_reject === true && gpu.hold_s > 35, "own_guard_lease_missing");
+    gpu.hold_who === owner && gpu.hold_reject === true && typeof gpu.hold_s === "number" &&
+    Number.isFinite(gpu.hold_s) && gpu.hold_s > 35, "own_guard_lease_missing");
   requireThat(gpu.active === null && gpu.count === 0 && gpu.waiting === 0 &&
     gpu.hold_sensitive_preparing === 0 && gpu.bg_in_turn === 0 &&
     gpu.admission_recovery_required === false && gpu.admission_journal_entries === 0, "gateway_not_quiet");
@@ -29,7 +36,7 @@ function guardState(health, stats, env = process.env, now = Date.now(), { forGen
     stats.background.interactive_waiting === 0 && stats.background.bg_active === 0 &&
     stats.tiers && Object.keys(stats.tiers).length > 0 &&
     Object.values(stats.tiers).every((tier) => tier.active_conns === 0 && tier.pending?.pending === 0), "gateway_not_quiet");
-  return { exit_code: 0, ownedLease: true, quiet: true };
+  return { exit_code: 0, quiet: true };
 }
 
 function checkRun(run, head, runId) {
@@ -57,7 +64,8 @@ async function issueOnce({ run, candidate, readRun, readHead, readJobs, readStat
     requireThat(current.status === "in_progress" && readyJob(await readJobs()), "windows_not_ready");
     requireThat(!(await readStatuses()).some((status) => status.context === context), "admission_already_attempted");
     const result = await readGuard();
-    requireThat(result?.exit_code === 0 && result.ownedLease === true && result.quiet === true, "guard_precheck_failed");
+    requireThat(result?.exit_code === 0 && result.ownedLease === true && result.quiet === true &&
+      result.coordinationQuiet === true, "guard_precheck_failed");
     return result;
   }, async () => {
     outsideQuietWindow(clock());
@@ -82,9 +90,10 @@ function gh(path, method = "GET", body) {
   return raw.trim() ? JSON.parse(raw) : null;
 }
 
-async function localJson(path) {
-  const response = await fetch(`http://127.0.0.1:8080${path}`, { redirect: "error", signal: AbortSignal.timeout(5_000) });
-  requireThat(response.status === 200, "gateway_http_unknown");
+async function localResponse(path, init = {}) {
+  const response = await fetch(`http://127.0.0.1:8080${path}`, {
+    ...init, redirect: "error", signal: AbortSignal.timeout(5_000),
+  });
   const parts = [];
   let size = 0;
   for await (const part of response.body) {
@@ -92,7 +101,79 @@ async function localJson(path) {
     requireThat(size <= 262_144, "gateway_response_oversized");
     parts.push(part);
   }
-  return JSON.parse(Buffer.concat(parts).toString("utf8"));
+  return { status: response.status, body: JSON.parse(Buffer.concat(parts).toString("utf8")) };
+}
+
+async function localJson(path) {
+  const response = await localResponse(path);
+  requireThat(response.status === 200, "gateway_http_unknown");
+  return response.body;
+}
+
+async function authenticateLease(env = process.env, request = localResponse) {
+  const { owner, token } = leaseCredentials(env);
+  // Invalid JSON is rejected before model resolution, queues or wake. First
+  // prove that this live gateway checks credentials before that rejection.
+  const decoy = `${token[0] === "A" ? "B" : "A"}${token.slice(1)}`;
+  const challenge = (credential) => request("/v1/chat/completions", {
+    method: "POST", body: "null", headers: {
+      "Content-Type": "application/json", "X-Maat-Hold-Owner": owner,
+      "X-Maat-Hold-Token": credential, "X-Maat-Client": "windows-qa-lease-proof",
+    },
+  });
+  const denied = await challenge(decoy);
+  requireThat(denied.status === 403 && denied.body?.error === "invalid_gpu_hold_credentials",
+    "lease_negative_challenge_failed");
+  const accepted = await challenge(token);
+  requireThat(accepted.status === 400 && accepted.body?.error === "invalid_json",
+    "lease_credential_challenge_failed");
+  return true;
+}
+
+function privateJson(path, optional = false) {
+  let fd;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (optional && error.code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    const stat = fstatSync(fd);
+    requireThat(stat.isFile() && stat.uid === process.getuid() && (stat.mode & 0o077) === 0 &&
+      stat.size <= 16_384, "coordination_file_unknown");
+    const bytes = Buffer.alloc(16_385);
+    const size = readSync(fd, bytes, 0, bytes.length, null);
+    requireThat(size <= 16_384, "coordination_file_oversized");
+    return JSON.parse(bytes.toString("utf8", 0, size));
+  } finally { closeSync(fd); }
+}
+
+function readCoordination() {
+  return {
+    bench: privateJson(`${CANONICAL_ROOT}/var/bench-window.lock`, true),
+    ci: privateJson(`${CANONICAL_ROOT}/var/ci-quiet.json`),
+    processes: execFileSync("/bin/ps", ["-Ao", "command="], {
+      encoding: "utf8", timeout: 5_000, maxBuffer: 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+    }),
+  };
+}
+
+function coordinationState({ bench, ci, processes }, now = Date.now()) {
+  requireThat(bench === null || (bench && !Array.isArray(bench) &&
+    typeof bench.expira_en === "number" && Number.isFinite(bench.expira_en) &&
+    bench.expira_en > 0 && typeof bench["dueño"] === "string" && bench["dueño"].length > 0),
+  "bench_state_unknown");
+  requireThat(bench === null || bench.expira_en * 1000 <= now, "bench_window_active");
+  const age = typeof ci?.updated === "number" ? now - Math.floor(ci.updated * 1000) : NaN;
+  requireThat(Number.isFinite(age) && age >= 0 && age <= 60_000 &&
+    ci.state === "off" && ci.lock_owner === null && ci.runners &&
+    !Array.isArray(ci.runners) && Object.keys(ci.runners).length > 0 &&
+    Object.values(ci.runners).every((state) => state === "running" || state === "off"),
+  "ci_coordination_unknown_or_active");
+  requireThat(typeof processes === "string" && processes.trim().length > 0 &&
+    !/(?:^|\n)\s*(?:\S*\/)?Runner\.Worker(?:\s|$)/.test(processes), "ci_worker_active_or_unknown");
+  return { coordinationQuiet: true };
 }
 
 function statuses(sha) {
@@ -132,8 +213,16 @@ async function main(argv) {
   const readRun = () => gh(`repos/${REPO}/actions/runs/${runId}`);
   const readHead = () => gh(`repos/${REPO}/commits/main`);
   const readJobs = () => gh(`repos/${REPO}/actions/runs/${runId}/jobs?per_page=100`);
-  const readGuard = async (forGeneration = true) =>
-    guardState(await localJson("/health"), await localJson("/stats"), process.env, Date.now(), { forGeneration });
+  const readGuard = async (forGeneration = true) => {
+    if (forGeneration) outsideQuietWindow(Date.now());
+    const authenticated = forGeneration && await authenticateLease();
+    const coordination = forGeneration ? readCoordination() : null;
+    const state = guardState(await localJson("/health"), await localJson("/stats"),
+      process.env, Date.now(), { forGeneration });
+    return forGeneration
+      ? { ...state, ...coordinationState(coordination), ownedLease: authenticated === true }
+      : state;
+  };
   try {
     requireThat(gh("user").login === "Gigisanta", "owner_identity_required");
     checkRelease(gh(`repos/${REPO}/releases/${candidate.releaseId}`), candidate, true);
@@ -212,7 +301,7 @@ async function main(argv) {
   process.exitCode = receipt.ok ? 0 : 1;
 }
 
-module.exports = { guardState, checkRun, readyJob, issueOnce };
+module.exports = { guardState, authenticateLease, coordinationState, checkRun, readyJob, issueOnce };
 if (require.main === module) main(process.argv.slice(2)).catch(() => {
   console.error("owner_admission_failed"); process.exitCode = 1;
 });

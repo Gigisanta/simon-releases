@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { guardState, checkRun, readyJob, issueOnce } = require("./windows-admit-owner.cjs");
+const { guardState, authenticateLease, coordinationState, checkRun, readyJob, issueOnce } = require("./windows-admit-owner.cjs");
 const NOW = Date.parse("2026-11-01T00:00:00Z");
 const OWNER = "resource_guard_12345_1234abcd";
 const ENV = { MAAT_HOLD_OWNER: OWNER, MAAT_HOLD_TOKEN: "fixture-token-not-a-secret-0000" };
@@ -17,6 +17,11 @@ function stats() {
     tiers: { simon: { active_conns: 0, pending: { pending: 0 } } },
   };
 }
+function coordination() {
+  return { bench: null, ci: { updated: NOW / 1000, state: "off", lock_owner: null,
+    runners: { "actions.runner.fixture": "running" } },
+  processes: "/sbin/launchd\n/Users/fixture/runner/bin/Runner.Listener run\n" };
+}
 const run = { id: 1234, repository: { full_name: "Gigisanta/simon-releases" }, event: "workflow_dispatch",
   head_branch: "main", run_attempt: 1, path: ".github/workflows/windows-native-qa.yml",
   head_sha: "a".repeat(40), actor: { login: "Gigisanta" }, status: "in_progress" };
@@ -29,7 +34,11 @@ function fixture(overrides = {}) {
     run, candidate: { sha256: "b".repeat(64) }, clock: () => NOW,
     readRun: async () => run, readHead: async () => ({ sha: run.head_sha }),
     readJobs: async () => jobs, readStatuses: async () => [],
-    readGuard: async () => { calls.push("precheck"); return guardState({ status: "ok" }, stats(), ENV, NOW); },
+    readGuard: async () => {
+      calls.push("precheck");
+      return { ...guardState({ status: "ok" }, stats(), ENV, NOW),
+        ...coordinationState(coordination(), NOW), ownedLease: true };
+    },
     post: async (body) => { calls.push("post"); return { ...body, id: 55, creator: { login: "Gigisanta" } }; },
     ...overrides,
   };
@@ -38,10 +47,14 @@ function fixture(overrides = {}) {
 
 test("owned quiet guard is required, not merely a resource_guard prefix", () => {
   assert.equal(guardState({ status: "ok" }, stats(), ENV, NOW).exit_code, 0);
+  assert.equal(guardState({ status: "ok" }, stats(), ENV, NOW).ownedLease, undefined,
+    "public owner metadata is not authenticated ownership");
   for (const mutate of [
     (s) => { s.gpu_turns.hold_who = "resource_guard_99999_deadbeef"; },
     (s) => { s.gpu_turns.lease_protected = false; },
     (s) => { s.gpu_turns.hold_s = 30; },
+    (s) => { s.gpu_turns.hold_s = "100"; },
+    (s) => { s.gpu_turns.hold_s = Infinity; },
     (s) => { s.gpu_turns.active = "simon"; },
     (s) => { s.gpu_turns.waiting = 1; },
     (s) => { s.gpu_turns.maintenance.quarantine.active = true; },
@@ -57,6 +70,75 @@ test("owned quiet guard is required, not merely a resource_guard prefix", () => 
   assert.throws(() => guardState({ status: "ok" }, stats(), ENV, Date.parse("2026-11-01T04:00:00Z")));
   assert.equal(guardState({ status: "ok" }, stats(), ENV, Date.parse("2026-11-01T04:00:00Z"),
     { forGeneration: false }).quiet, true, "settlement remains observable after the public pause starts");
+});
+
+test("lease credentials are authenticated before JSON rejection without any model or wake payload", async () => {
+  const requests = [];
+  const request = async (path, options) => {
+    requests.push({ path, ...options });
+    return options.headers["X-Maat-Hold-Token"] === ENV.MAAT_HOLD_TOKEN
+      ? { status: 400, body: { error: "invalid_json" } }
+      : { status: 403, body: { error: "invalid_gpu_hold_credentials" } };
+  };
+  assert.equal(await authenticateLease(ENV, request), true);
+  assert.equal(requests.length, 2);
+  assert.notEqual(requests[0].headers["X-Maat-Hold-Token"], ENV.MAAT_HOLD_TOKEN);
+  assert.equal(requests[1].headers["X-Maat-Hold-Token"], ENV.MAAT_HOLD_TOKEN);
+  for (const request of requests) {
+    assert.equal(request.path, "/v1/chat/completions");
+    assert.equal(request.method, "POST");
+    assert.equal(request.body, "null", "no model, prompt, queue request or inference");
+    assert.equal(request.headers["X-Maat-Hold-Owner"], OWNER);
+  }
+});
+
+test("a copied public owner with a false token and unknown authentication emit no admission", async () => {
+  const failures = [
+    async () => ({ status: 403, body: { error: "invalid_gpu_hold_credentials" } }),
+    async () => ({ status: 400, body: { error: "invalid_json" } }),
+    async () => ({ status: 403, body: { error: "invalid_json" } }),
+    async () => { throw new Error("transport unknown"); },
+  ];
+  for (const request of failures) {
+    let writes = 0;
+    const { input } = fixture({
+      readGuard: async () => {
+        await authenticateLease({ ...ENV, MAAT_HOLD_TOKEN: "copied-owner-wrong-token-0000" }, request);
+        return { exit_code: 0, quiet: true, ownedLease: true, coordinationQuiet: true };
+      },
+      post: async () => { writes += 1; },
+    });
+    await assert.rejects(issueOnce(input));
+    assert.equal(writes, 0);
+  }
+});
+
+test("canonical bench and CI coordination must be fresh, off, unowned and worker-free", () => {
+  assert.equal(coordinationState(coordination(), NOW).coordinationQuiet, true);
+  const expired = coordination();
+  expired.bench = { "dueño": "previous-bench", expira_en: NOW / 1000 - 1 };
+  assert.equal(coordinationState(expired, NOW).coordinationQuiet, true);
+  for (const mutate of [
+    (s) => { s.bench = {}; },
+    (s) => { s.bench = { "dueño": "foreign-bench", expira_en: NOW / 1000 + 60 }; },
+    (s) => { s.bench = { "dueño": OWNER, expira_en: NOW / 1000 + 60 }; },
+    (s) => { s.bench = { "dueño": "unknown", expira_en: "bad-date" }; },
+    (s) => { s.ci = null; },
+    (s) => { s.ci.updated = NOW / 1000 - 60.001; },
+    (s) => { s.ci.updated = NOW / 1000 + 1; },
+    (s) => { s.ci.state = "paused"; },
+    (s) => { s.ci.state = "draining"; },
+    (s) => { s.ci.state = "resuming"; },
+    (s) => { s.ci.lock_owner = "foreign-bench"; },
+    (s) => { s.ci.runners = {}; },
+    (s) => { s.ci.runners["actions.runner.fixture"] = "paused"; },
+    (s) => { s.processes = ""; },
+    (s) => { s.processes = null; },
+    (s) => { s.processes += "/Users/fixture/runner/bin.2.331.0/Runner.Worker spawnclient 1 2\n"; },
+  ]) {
+    const altered = coordination(); mutate(altered);
+    assert.throws(() => coordinationState(altered, NOW));
+  }
 });
 
 test("only exact first-attempt main workflow, actor and ready step qualify", () => {
@@ -82,7 +164,9 @@ test("fresh successful guard precedes the sole creator-bound status write", asyn
 
 test("blocked, unknown or thrown precheck emits no status", async () => {
   for (const result of [{ exit_code: 75 }, { exit_code: null }, { exit_code: 0 },
-    { exit_code: 0, ownedLease: true, quiet: false }, undefined]) {
+    { exit_code: 0, ownedLease: true, quiet: false, coordinationQuiet: true },
+    { exit_code: 0, ownedLease: true, quiet: true },
+    { exit_code: 0, ownedLease: true, quiet: true, coordinationQuiet: false }, undefined]) {
     const { calls, input } = fixture({ readGuard: async () => result });
     await assert.rejects(issueOnce(input));
     assert.deepEqual(calls, []);
