@@ -41,6 +41,9 @@ usa el equipo/perfil de una persona, WSL, un fork privado ni recursos pagos.
    ni obtiene permisos enviando un header. Cargar **sólo** los environment
    secrets `SIMON_QA_EMAIL` y `SIMON_QA_PASSWORD`, después de esa verificación.
    Nunca usar `user-login.env`, secretos de inferencia ni un PAT en Actions.
+   La única copia local de credenciales es
+   `~/.hermes/project-env/HerMaatOS/work/simon-ai/qa-windows.env`, modo `0600`;
+   nunca imprimirla ni adjuntarla. El issuer de admisión no la necesita.
 4. El alta deja ausente el permiso funcional de IA y apagados los consentimientos
    opcionales de analytics, marketing y training. El workflow **nunca acepta,
    simula ni puentea un consentimiento**. `baseline-login` y `upgrade-login`
@@ -54,6 +57,8 @@ usa el equipo/perfil de una persona, WSL, un fork privado ni recursos pagos.
    `contents:read` y `statuses:read`; no necesita token de publicación.
 6. Hacer la revisión y los checks offline de abajo una sola vez bajo el owner de
    integración. Ningún dispatch ni instalación se ejecutó al agregar este arnés.
+   La barrera de telemetría previa a JS también debe observarse en Windows real;
+   su implementación/offline tests no equivalen a cero huella en producción.
 
 ### Modos y ejecución manual
 
@@ -98,6 +103,66 @@ ejecutable, además de la firma Tauri válida. Un cambio de identidad Authentico
 requiere revisión; no se lo acepta silenciosamente. Tampoco se afirma que se
 haya probado una oferta/instalación del updater: este recorrido es una
 **actualización manual NSIS**, y `updaterInstall=not-exercised`.
+
+### Telemetría anónima: barrera anterior a scripts del producto
+
+La clase `test` no identifica el POST legacy `auth:false`. Por eso no basta
+con excluir la cuenta en DB, ni con instalar `page.route` después de arrancar.
+Microsoft documenta
+[`WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER`](https://learn.microsoft.com/en-us/microsoft-edge/webview2/reference/win32/webview2-idl?view=webview2-1.0.4258.31)
+para esperar `Runtime.runIfWaitingForDebugger`. El
+[`connectOverCDP` de Playwright 1.58.2](https://github.com/microsoft/playwright/blob/v1.58.2/packages/playwright-core/src/server/chromium/crPage.ts)
+ya envía ese comando durante su inicialización; **no es el primer cliente**.
+
+El ejecutable se inicia con esa variable y CDP loopback, sin credenciales en su
+environment. Antes de conectar Playwright se inicia `windows-cdp-guard.cjs`,
+un guardian raw-CDP separado, sin secretos y ligado al PID/path/boot de esa app:
+
+1. Descubre exactamente un target page local; rechaza otro origen, más targets
+   o un WebSocket que no sea su `127.0.0.1:port/devtools/page/id`.
+2. Registra/bufferea eventos antes de habilitar `Debugger`. **No usa
+   `Runtime.enable`, Playwright ni un attach auto-resumidor** en esta fase.
+   La respuesta de `Page.getFrameTree` en el mismo socket es la barrera de
+   catch-up; exige **cero scripts previos**, incluidos scripts de preload y
+   anónimos. No intenta adivinar cuáles podrían haber sido inocuos.
+3. Una evaluación propia identificada sólo contiene `debugger`. Exige su
+   `Debugger.paused` con un único frame y script id concordante. Esa es una
+   pausa V8 explícitamente observada, **no** una supuesta confirmación de la
+   variable WebView ni `Target.waitingForDebugger` de otro tipo de suspensión.
+4. Dentro de ese frame pausado instala y lee el ACK del hook
+   `windows-telemetry-guard.cjs`. Rechaza un bridge preexistente, ausencia de
+   fetch, ACK incorrecto o cualquier script ajeno previo al hook.
+5. Arma tanto `Page.addScriptToEvaluateOnNewDocument` como el breakpoint
+   `beforeScriptExecution`; **sólo entonces** envía
+   `Runtime.runIfWaitingForDebugger` y `Debugger.resume`. El guardian permanece
+   conectado entre steps, pausa cada script y confirma el hook antes de
+   reanudarlo, también en la recarga nativa de generación. Procesa pausas
+   bufferizadas antes de esperar la respuesta de la evaluación de bootstrap.
+
+El hook rechaza **sólo POST** al origen exacto
+`https://simon.maat.work` y path `/api/telemetry/section-view`, con o sin query:
+en `window.fetch` y antes del
+[`invoke('plugin:http|fetch', {clientConfig: {url, method}})` oficial](https://github.com/tauri-apps/plugins-workspace/blob/74a44c1d5694324b7fb9ba5ee9271a3096da9387/plugins/http/guest-js/index.ts).
+El recurso HTTP Rust de ese endpoint no llega a crearse. Intercepta la creación
+del bridge Tauri, incluso asignación y `Object.defineProperty` del invoke
+inmutable, en vez de fingir que una ruta WebView alcanza el transporte Rust.
+Los demás endpoints/verbos/comandos reciben los mismos argumentos originales:
+no fabrica respuestas de auth/chat/consentimiento ni deshabilita telemetría global.
+El login exige además que fetch y el invoke ya creado sigan efectivamente
+guardados antes de escribir credenciales.
+
+Falta de ACK, catch-up no vacío, target ambiguo, guardian caído o heartbeat
+viejo bloquean la UI. Un fallo del guardian termina **su PID original** antes
+de desconectar el debugger; si no puede terminarlo, conserva la sesión abierta,
+sin reanudación deliberada. No puede borrar el estado de un candidato posterior.
+
+La evidencia publica únicamente el tipo de pausa/orden observado, cero scripts
+previos, ACK antes de resume, guardian persistente y contadores de bloqueos
+fetch/invoke. **`zeroFootprint=not-claimed` permanece explícito**: navegación,
+servicios nativos fuera del bridge u otras fuentes no se convierten en “cero
+tráfico global”. Hasta el primer run Windows real y la correlación del owner,
+la exclusión total sigue **sin verificar**; un contador cero no prueba que el
+tracker intentó enviar ni que la instrumentación haya sido ejercitada.
 
 ### Generación: UI real y admisión externa
 
@@ -161,6 +226,41 @@ nunca PASS. El owner sigue siendo responsable de confirmar settlement del
 backend antes de liberar recursos. No redispatch/reintento automático para
 reparar una solicitud incierta.
 
+### Operación local del owner de admisión
+
+Sólo después del review, checks del integrador, configuración de environment
+main-only, fixture y consentimiento normal ya autorizado, despachar manualmente
+el modo full. El issuer **no despacha workflows ni genera automáticamente**.
+
+En una **operación persistente ya admitida por el `resource_guard` canónico
+`gpu-heavy`**, ejecutar desde este checkout público revisado:
+
+```sh
+node .github/scripts/windows-admit-owner.cjs \
+  --run-id REVIEWED_RUN_ID \
+  --release-id REVIEWED_RELEASE_ID \
+  --asset-id REVIEWED_INSTALLER_ASSET_ID \
+  --sha256 REVIEWED_64_LOWERCASE_HEX_SHA256 \
+  --receipt /ABSOLUTE_PRIVATE_0700_DIRECTORY/NEW_RECEIPT.json
+```
+
+El directorio privado del recibo debe existir con modo `0700`; el archivo debe
+ser **nuevo**, se crea `0600` y no se publica. No es un archivo de credenciales.
+Reservar `--run-seconds 1800` en el guard canónico para el workflow de 25 min y
+su settlement; **no ejecutar ese Node como comando suelto**, simular variables
+ni copiar un hold ajeno para “admitirlo”. `MAAT_HOLD_OWNER` y `MAAT_HOLD_TOKEN`
+deben ser los que posee ese mismo guard y corresponder al hold vivo de 8080.
+No se transfiere el token ni una API key de inferencia a Actions.
+
+El issuer usa el `gh` local ya autorizado del owner, exige creator `Gigisanta`,
+main/SHA revisados y el paso exacto en progreso. Espera como máximo 10 min y
+vuelve a comprobar health/stats, quiet/maintenance/admisión/hold propio y ART
+dentro de `admitted-action.cjs`. Antes del único POST persiste y sincroniza el
+estado incierto en el recibo; un error o resultado desconocido **no se reintenta**.
+Conserva la operación/guard hasta estado terminal del run de ese SHA y dos
+snapshots quiet de settlement. Si no se puede demostrar settlement, no liberar
+recursos ni redispatch: investigar bajo ese mismo owner.
+
 ### Evidencia y aceptación
 
 Sólo el JSON allowlisted se publica en el **job summary**: SHA de workflow,
@@ -209,6 +309,9 @@ Criterios obligatorios para el owner:
   updater-offer e instalación automática son N/A, no se ejercitan aquí.
 - Telemetría/cobros: el owner de cuenta verifica exclusión por marker actual de
   DB y consents opcionales apagados; el summary de UI no sustituye esa prueba.
+  El POST anónimo no se atribuye a ese marker: exigir también la barrera previa
+  a scripts observada en Windows real y correlación del owner, no sólo el hook
+  escrito o un contador cero. `zeroFootprint=not-claimed` no desaparece.
 
 Checks que debe ejecutar el integrador, **no ejecutados al preparar este cambio**:
 
@@ -216,7 +319,10 @@ Checks que debe ejecutar el integrador, **no ejecutados al preparar este cambio*
 node --check .github/scripts/windows-contract.cjs
 node --check .github/scripts/windows-native-qa.cjs
 node --check .github/scripts/windows-ui.cjs
-node --test .github/scripts/windows-contract.test.cjs
+node --check .github/scripts/windows-cdp-guard.cjs
+node --check .github/scripts/windows-telemetry-guard.cjs
+node --check .github/scripts/windows-admit-owner.cjs
+node --test .github/scripts/windows-contract.test.cjs .github/scripts/windows-cdp-guard.test.cjs .github/scripts/windows-admit-owner.test.cjs
 actionlint .github/workflows/windows-native-qa.yml
 ```
 

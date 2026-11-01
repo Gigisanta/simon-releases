@@ -142,9 +142,11 @@ async function prepare() {
   });
   await record("assets", { baseline, candidate: selectedCandidate, upgradeMethod: "manual-nsis-not-updater" });
 }
-async function stopNative() {
-  let state;
-  try { state = await readJson("native.json"); } catch { return; }
+async function stopNative(expectedState) {
+  let state = expectedState;
+  if (!state) {
+    try { state = await readJson("native.json"); } catch { return; }
+  }
   const selection = await readJson("selection.json");
   requireThat(state.executable === selection.executable && Number.isSafeInteger(state.pid) && state.pid > 0,
     "native_process_identity_invalid");
@@ -158,7 +160,9 @@ async function stopNative() {
     stdio: "ignore", windowsHide: true, timeout: 15_000,
   });
   requireThat(result.status === 0, "native_cleanup_failed");
-  await fs.rm(path.join(root(), "native.json"), { force: true });
+  // A detached guardian owns its original PID only. It must never remove a
+  // later candidate's state file while handling the baseline socket closing.
+  if (!expectedState) await fs.rm(path.join(root(), "native.json"), { force: true });
 }
 async function summarize() {
   let data;
@@ -168,7 +172,7 @@ async function summarize() {
   // Only this structured evidence file is emitted. No stdout/stderr from the
   // application, Playwright error/locator messages, HAR, trace, DOM or image.
   const permitted = ["schema", "result", "run", "assets", "installBaseline", "installCandidate", "loginBaseline",
-    "loginCandidate", "consent", "generation", "failure"];
+    "loginCandidate", "telemetry", "consent", "generation", "failure"];
   const publicEvidence = Object.fromEntries(permitted.filter((name) => data[name] !== undefined).map((name) => [name, data[name]]));
   publicEvidence.releaseAcceptance = "not-claimed";
   publicEvidence.updaterInstall = "not-exercised";

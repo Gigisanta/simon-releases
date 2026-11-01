@@ -2,6 +2,7 @@
 
 const { spawn, spawnSync } = require("node:child_process");
 const net = require("node:net");
+const { randomUUID } = require("node:crypto");
 const { chromium } = require("playwright-core");
 const admittedAction = require("./admitted-action.cjs");
 const {
@@ -42,7 +43,28 @@ function nativeEnvironment(port, selection) {
   }
   env.WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = `--remote-debugging-address=127.0.0.1 --remote-debugging-port=${port}`;
   env.WEBVIEW2_USER_DATA_FOLDER = selection.webviewDirectory;
+  env.WEBVIEW2_WAIT_FOR_SCRIPT_DEBUGGER = "1";
   return env;
+}
+async function guardianState(state) {
+  const guardian = await readJson(`telemetry-${state.label}.json`);
+  requireThat(guardian.schema === "simon-cdp-guardian/v1" && guardian.bootId === state.guardBootId &&
+    guardian.nativePid === state.pid && guardian.guardianPid === state.guardPid &&
+    guardian.phase === "running" && Number.isSafeInteger(guardian.heartbeatAt) &&
+    Date.now() - guardian.heartbeatAt >= 0 && Date.now() - guardian.heartbeatAt <= 5000 &&
+    guardian.proof?.preexistingParsedScripts === 0 && guardian.proof.hookAcknowledgedBeforeResume === true,
+  "telemetry_guard_not_live");
+  return guardian;
+}
+async function telemetryEvidence(page, state) {
+  const guardian = await guardianState(state);
+  const hook = await page.evaluate(() => window[Symbol.for("simon.qa.telemetry.guard.v1")]?.());
+  requireThat(hook?.schema === "simon-telemetry-guard/v1" && hook.bootId === state.guardBootId &&
+    hook.fetchGuarded === true && hook.bridgeArmed === true && hook.bridgeGuarded === true &&
+    Number.isSafeInteger(hook.fetchBlocked) && Number.isSafeInteger(hook.invokeBlocked), "telemetry_guard_not_ready");
+  return { ...guardian.proof, guardedScripts: guardian.guardedScripts,
+    windowFetchGuarded: true, tauriHttpInvokeGuarded: true,
+    fetchBlocked: hook.fetchBlocked, invokeBlocked: hook.invokeBlocked, zeroFootprint: "not-claimed" };
 }
 async function attach(state, deadline) {
   requireThat(Number.isSafeInteger(state.pid) && state.pid > 0 && Number.isInteger(state.port) && state.port > 0,
@@ -57,6 +79,9 @@ async function attach(state, deadline) {
     stdio: "ignore", windowsHide: true, timeout: Math.min(5000, remaining(deadline)),
   });
   requireThat(windowCheck.status === 0, "native_window_unavailable");
+  // Playwright may not be the first CDP client: the raw guardian must already
+  // have proven its bootstrap pause and acknowledged both scoped hooks.
+  await guardianState(state);
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${state.port}`, { timeout: remaining(deadline) });
   let pages;
   do {
@@ -69,7 +94,7 @@ async function attach(state, deadline) {
   const page = pages[0];
   page.setDefaultTimeout(5000);
   page.setDefaultNavigationTimeout(5000);
-  return { browser, page, context: page.context() };
+  return { browser, page, context: page.context(), nativeState: state };
 }
 async function launch(label, deadline) {
   const selection = await readJson("selection.json");
@@ -81,7 +106,7 @@ async function launch(label, deadline) {
   child.once("error", () => { launchFailed = true; });
   requireThat(Number.isSafeInteger(child.pid), "native_launch_failed");
   child.unref();
-  const state = { pid: child.pid, port, executable: selection.executable, label };
+  const state = { pid: child.pid, port, executable: selection.executable, label, guardBootId: randomUUID() };
   await writeJson("native.json", state);
   // Wait only for the native app's local CDP endpoint; never start a browser.
   while (true) {
@@ -95,6 +120,27 @@ async function launch(label, deadline) {
       if (error instanceof QaError) throw error;
     }
     await pause(Math.min(100, remaining(deadline)));
+  }
+  const guardianEnv = nativeEnvironment(port, selection);
+  guardianEnv.SIMON_QA_ROOT = process.env.SIMON_QA_ROOT;
+  const guardian = spawn(process.execPath, [require.resolve("./windows-cdp-guard.cjs"), label, state.guardBootId, String(deadline)], {
+    env: guardianEnv, stdio: "ignore", detached: true, windowsHide: true,
+  });
+  let guardianFailed = false;
+  guardian.once("error", () => { guardianFailed = true; });
+  requireThat(Number.isSafeInteger(guardian.pid), "telemetry_guard_launch_failed");
+  guardian.unref();
+  state.guardPid = guardian.pid;
+  await writeJson("native.json", state);
+  while (true) {
+    requireThat(!guardianFailed && guardian.exitCode === null, "telemetry_guard_exited");
+    let status;
+    try { status = await readJson(`telemetry-${label}.json`); } catch { /* Not ready yet. */ }
+    if (status?.bootId === state.guardBootId) {
+      requireThat(status.phase === "bootstrapping" || status.phase === "running", "telemetry_guard_blocked");
+      if (status.phase === "running") break;
+    }
+    await pause(Math.min(50, remaining(deadline)));
   }
   return await attach(state, deadline);
 }
@@ -117,10 +163,20 @@ async function login(label) {
   requireThat(typeof email === "string" && email.length > 0 && typeof password === "string" && password.length > 0,
     "qa_credentials_missing");
   const started = Date.now();
-  const { page, context } = await launch(label, started + DEADLINE_MS);
+  await record("telemetry", {
+    scope: "section-view-post-window-fetch-and-tauri-http-invoke",
+    startupBarrier: "required-raw-cdp-before-product-script",
+    accountExclusion: "owner-account-contract-required",
+    zeroFootprint: "not-claimed",
+    strictAcceptance: "requires-observed-windows-runtime-proof",
+  });
+  const { page, context, nativeState } = await launch(label, started + DEADLINE_MS);
   const noChat = await chatBlocker(context);
   await page.locator('input[name="identity"], a[href^="/ingresar"], #chat-titulo').first()
     .waitFor({ state: "visible", timeout: remaining(started + DEADLINE_MS) });
+  // Reject an unsupported bridge before entering credentials or navigating.
+  await telemetryEvidence(page, nativeState);
+  remaining(started + DEADLINE_MS);
   const startupMs = Date.now() - started;
   const loginStarted = Date.now();
   const deadline = loginStarted + DEADLINE_MS;
@@ -162,6 +218,7 @@ async function login(label) {
   const consentBody = await consentResponse.json();
   requireThat(typeof consentBody?.consent?.granted === "boolean", "consent_state_unknown");
   noChat();
+  const telemetry = await telemetryEvidence(page, nativeState);
   remaining(deadline);
   const selection = await readJson("selection.json");
   await record(label === "baseline" ? "loginBaseline" : "loginCandidate", {
@@ -169,6 +226,7 @@ async function login(label) {
     nativeWindow: "verified", nativeWebView: "installed-webview2-cdp", login: "native-ui-password",
     fixture: "immutable-test-self", restoredSession, aiConsentGranted: consentBody.consent.granted,
     chatRequests: 0, updaterOffer: "not-asserted", updaterInstall: "not-exercised",
+    telemetry,
   });
   if (label === "baseline" || selection.mode !== "full-generation") await stopNative();
   // Candidate/full-generation intentionally keeps the installed app alive for
@@ -188,9 +246,10 @@ async function requireConsent(page) {
   return composer;
 }
 async function consent() {
-  const { page, context } = await existingPage();
+  const { page, context, nativeState } = await existingPage();
   const noChat = await chatBlocker(context);
   await requireConsent(page);
+  await telemetryEvidence(page, nativeState);
   noChat();
   await record("consent", { state: "already-granted-by-owner", grantedByWorkflow: false });
 }
@@ -217,7 +276,7 @@ async function waitForAdmission(candidateSha) {
 }
 async function generate() {
   requireThat(process.env.SIMON_QA_MODE === "full-generation" && process.env.GITHUB_RUN_ATTEMPT === "1", "generation_not_authorized");
-  const { page, context } = await existingPage();
+  const { page, context, nativeState } = await existingPage();
   const composer = await requireConsent(page);
   const selection = await readJson("selection.json");
   // Reload the actual installed WebView through CDP so the normal native
@@ -234,6 +293,7 @@ async function generate() {
   requireThat(consentResponse.status() === 200 && (await consentResponse.json())?.consent?.granted === true,
     "consent_required");
   await requireConsent(page);
+  await telemetryEvidence(page, nativeState);
   requireThat(selection.candidate?.version === "0.1.12", "candidate_identity_missing");
   let armed = false;
   let attempts = 0;
@@ -270,12 +330,14 @@ async function generate() {
   const admission = await waitForAdmission(selection.candidate.sha256);
   let elapsedMs;
   let requestId;
+  let generationTelemetry;
   try {
     await admittedAction(async () => {
       await assertTrustedRun();
       const liveRelease = await githubJson(`/repos/${REPO}/releases/${selection.candidate.releaseId}`);
       checkRelease(liveRelease, selection.candidate, true);
       await health();
+      await telemetryEvidence(page, nativeState);
       await requireConsent(page);
       finalStatuses = await statuses();
       const fresh = checkAdmission(finalStatuses, process.env, selection.candidate.sha256);
@@ -318,6 +380,7 @@ async function generate() {
               .map((element) => element.textContent).join("\n");
             return rendered === text;
           }, { text: reply.text, count: assistantsBefore }, { timeout: remaining(deadline) });
+          generationTelemetry = await telemetryEvidence(page, nativeState);
           requireThat(!routeFailure && attempts === 1 && dispatched === 1, "extra_chat_request");
           remaining(deadline);
           elapsedMs = Date.now() - started;
@@ -338,6 +401,7 @@ async function generate() {
       admissionStatusId: admission.id, admissionContext: admission.context,
       admissionCreatedAt: admission.createdAt, admissionExpiresEpoch: admission.expiresEpoch,
       serverRequestId: requestId, providerEvidence: "owner-correlation-required",
+      telemetry: generationTelemetry,
     });
   } catch (error) {
     await record("generation", {
